@@ -6,6 +6,8 @@ ControlNet-LLLite is a lightweight, LoRA-like conditional control module origina
 
 > **Status:** experimental. Currently supports image generation only (`T=1`). `--blocks_to_swap`, `--cpu_offload_checkpointing`, `--unsloth_offload_checkpointing`, `--deepspeed`, and `--fused_backward_pass` are not yet supported and the training script will assert if any of them is enabled.
 
+An experimental ComfyUI ControlNet-LLLite node for Anima is also available [here](https://github.com/kohya-ss/ComfyUI-Anima-LLLite).
+
 <details>
 <summary>日本語</summary>
 
@@ -14,6 +16,8 @@ ControlNet-LLLite is a lightweight, LoRA-like conditional control module origina
 ControlNet-LLLite は SDXL 向けに導入された LoRA ライクな軽量条件付け手法です（オリジナルの解説は [`train_lllite_README-ja.md`](./train_lllite_README-ja.md) を参照）。Anima 版では、Anima が採用する DiT (MiniTrainDIT) アーキテクチャに移植してあり、各 Transformer ブロックの attention の `Linear` レイヤに小さな adapter を貼り、conditioning 画像を埋め込んだ単一の `conditioning1` を全モジュールに配布する構成になっています。
 
 > **ステータス:** 実験的実装です。現状は画像生成（`T=1`）のみ対応しています。`--blocks_to_swap` / `--cpu_offload_checkpointing` / `--unsloth_offload_checkpointing` / `--deepspeed` / `--fused_backward_pass` には未対応で、指定すると学習スクリプトが assert で停止します。
+
+実験的なComfyUI用のControlNet-LLLiteノードも [こちら](https://github.com/kohya-ss/ComfyUI-Anima-LLLite) で公開しています。
 
 </details>
 

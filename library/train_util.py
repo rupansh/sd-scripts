@@ -6394,6 +6394,11 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["flow_shift"] = m.group(1)
                 continue
 
+            m = re.match(r"am ([\d\.\-,]+)", parg, re.IGNORECASE)
+            if m:  # additional network multiplier(s) — comma-separated list, same as gen_img.py
+                prompt_dict["additional_network_multiplier"] = [float(v) for v in m.group(1).split(",")]
+                continue
+
         except ValueError as ex:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)

@@ -147,8 +147,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--lllite_target_layers", type=str, default=None,
-        choices=list(ControlNetLLLiteDiT.TARGET_LAYERS_CHOICES),
-        help="override target_layers from weights metadata",
+        help="override target_layers from weights metadata (preset or comma-separated atomic specifiers)",
+    )
+    parser.add_argument(
+        "--lllite_cond_dim", type=int, default=None,
+        help="override conditioning1 trunk channel width from weights metadata",
+    )
+    parser.add_argument(
+        "--lllite_cond_resblocks", type=int, default=None,
+        help="override conditioning1 ResBlock count from weights metadata",
+    )
+    parser.add_argument(
+        "--lllite_use_aspp", type=str, default=None, choices=["true", "false"],
+        help="override use_aspp from weights metadata (true/false)",
     )
 
     args = parser.parse_args()
@@ -237,14 +248,38 @@ def load_dit_model(args, device, dit_weight_dtype=None):
         if args.lllite_mlp_dim is not None
         else int(meta.get("lllite.mlp_dim", 64))
     )
+    # canonical atomic 形式 (lllite.target_atomics) を優先的に参照、なければ lllite.target_layers にフォールバック
     target_layers = (
         args.lllite_target_layers
         if args.lllite_target_layers is not None
-        else meta.get("lllite.target_layers", "self_attn_q")
+        else meta.get("lllite.target_atomics", meta.get("lllite.target_layers", "self_attn_q"))
     )
+    cond_dim = (
+        args.lllite_cond_dim
+        if args.lllite_cond_dim is not None
+        else int(meta.get("lllite.cond_dim", 64))
+    )
+    cond_resblocks = (
+        args.lllite_cond_resblocks
+        if args.lllite_cond_resblocks is not None
+        else int(meta.get("lllite.cond_resblocks", 1))
+    )
+    if args.lllite_use_aspp is not None:
+        use_aspp = args.lllite_use_aspp == "true"
+    else:
+        use_aspp = meta.get("lllite.use_aspp", "false").lower() == "true"
+    aspp_dilations_meta = meta.get("lllite.aspp_dilations")
+    if use_aspp and aspp_dilations_meta:
+        aspp_dilations = tuple(int(d) for d in aspp_dilations_meta.split(",") if d.strip())
+    else:
+        from networks.control_net_lllite_anima import ASPP_DEFAULT_DILATIONS as _ASPP_DD
+        aspp_dilations = _ASPP_DD
+    version = meta.get("lllite.version", "?")
     logger.info(
-        f"LLLite config: cond_emb_dim={cond_emb_dim}, mlp_dim={mlp_dim}, "
-        f"target_layers={target_layers}, multiplier={args.lllite_multiplier}"
+        f"LLLite config (v{version}): cond_emb_dim={cond_emb_dim}, mlp_dim={mlp_dim}, "
+        f"target_layers={target_layers}, cond_dim={cond_dim}, cond_resblocks={cond_resblocks}, "
+        f"use_aspp={use_aspp}{(' dilations=' + str(list(aspp_dilations))) if use_aspp else ''}, "
+        f"multiplier={args.lllite_multiplier}"
     )
 
     lllite = ControlNetLLLiteDiT(
@@ -253,6 +288,10 @@ def load_dit_model(args, device, dit_weight_dtype=None):
         mlp_dim=mlp_dim,
         target_layers=target_layers,
         multiplier=args.lllite_multiplier,
+        cond_dim=cond_dim,
+        cond_resblocks=cond_resblocks,
+        use_aspp=use_aspp,
+        aspp_dilations=aspp_dilations,
     )
     load_lllite_weights(lllite, args.lllite_weights, strict=False)
     lllite.apply_to()

@@ -43,6 +43,9 @@ from networks.control_net_lllite_anima import (
     AnimaControlNetLLLiteWrapper,
     save_lllite_model,
     load_lllite_weights,
+    LLLITE_ARCH_VERSION,
+    PRESETS as LLLITE_PRESETS,
+    ATOMIC_SPECIFIERS as LLLITE_ATOMIC_SPECIFIERS,
 )
 
 setup_logging()
@@ -127,8 +130,29 @@ def add_anima_lllite_arguments(parser: argparse.ArgumentParser):
         "--lllite_target_layers",
         type=str,
         default="self_attn_q",
-        choices=list(ControlNetLLLiteDiT.TARGET_LAYERS_CHOICES),
-        help="which Linear layers to attach LLLite to / LLLite を貼る対象レイヤ (default: self_attn_q)",
+        help=(
+            "which Linear layers to attach LLLite to. "
+            "Either a preset name or a comma-separated list of atomic specifiers. "
+            f"presets: {list(LLLITE_PRESETS)}, atomic: {list(LLLITE_ATOMIC_SPECIFIERS)}. "
+            "default: self_attn_q"
+        ),
+    )
+    parser.add_argument(
+        "--lllite_cond_dim",
+        type=int,
+        default=64,
+        help="conditioning1 trunk channel width / conditioning1 内部の中間チャネル幅 (default: 64)",
+    )
+    parser.add_argument(
+        "--lllite_cond_resblocks",
+        type=int,
+        default=1,
+        help="number of ResBlocks in conditioning1 / conditioning1 の ResBlock 段数 (default: 1)",
+    )
+    parser.add_argument(
+        "--lllite_use_aspp",
+        action="store_true",
+        help="enable ASPP (Atrous Spatial Pyramid Pooling) at the end of conditioning1 / conditioning1 末尾に ASPP を挿入",
     )
     parser.add_argument(
         "--lllite_dropout",
@@ -343,6 +367,9 @@ def train(args):
         target_layers=args.lllite_target_layers,
         dropout=args.lllite_dropout,
         multiplier=args.lllite_multiplier,
+        cond_dim=args.lllite_cond_dim,
+        cond_resblocks=args.lllite_cond_resblocks,
+        use_aspp=args.lllite_use_aspp,
     )
 
     if args.network_weights is not None:
@@ -490,10 +517,18 @@ def train(args):
             None, args, False, False, False, is_stable_diffusion_ckpt=True, anima="preview"
         ).to_metadata_dict()
         sai_metadata["modelspec.architecture"] = "anima-preview/control-net-lllite"
+        sai_metadata["lllite.version"] = LLLITE_ARCH_VERSION
         sai_metadata["lllite.cond_emb_dim"] = str(args.cond_emb_dim)
         sai_metadata["lllite.mlp_dim"] = str(args.lllite_mlp_dim)
         sai_metadata["lllite.target_layers"] = args.lllite_target_layers
         unwrapped = accelerator.unwrap_model(wrapper).lllite
+        # canonical atomic 形式も記録 (推論時の解決と log 用、preset 名と冗長だが互換維持)
+        sai_metadata["lllite.target_atomics"] = unwrapped.target_atomics_str
+        sai_metadata["lllite.cond_dim"] = str(args.lllite_cond_dim)
+        sai_metadata["lllite.cond_resblocks"] = str(args.lllite_cond_resblocks)
+        sai_metadata["lllite.use_aspp"] = "true" if args.lllite_use_aspp else "false"
+        if args.lllite_use_aspp:
+            sai_metadata["lllite.aspp_dilations"] = ",".join(str(d) for d in unwrapped.aspp_dilations)
         save_lllite_model(ckpt_file, unwrapped, dtype=save_dtype, metadata=sai_metadata)
 
     def _save_step(global_step_: int, epoch_: int):

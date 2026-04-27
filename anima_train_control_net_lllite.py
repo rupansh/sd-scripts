@@ -258,6 +258,18 @@ def train(args):
                     args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, False, False
                 )
             )
+        logger.info("Loading tokenizers...")
+        weight_dtype, save_dtype = train_util.prepare_dtype(args)
+        qwen3_text_encoder, qwen3_tokenizer = anima_utils.load_qwen3_text_encoder(args.qwen3, dtype=weight_dtype, device="cpu")
+        t5_tokenizer = anima_utils.load_t5_tokenizer(args.t5_tokenizer_path)
+        tokenize_strategy = strategy_anima.AnimaTokenizeStrategy(
+            qwen3_tokenizer=qwen3_tokenizer,
+            t5_tokenizer=t5_tokenizer,
+            qwen3_max_length=args.qwen3_max_token_length,
+            t5_max_length=args.t5_max_token_length,
+        )
+        strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
+
         train_dataset_group.set_current_strategies()
         train_util.debug_dataset(train_dataset_group, True)
         return

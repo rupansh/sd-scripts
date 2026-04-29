@@ -5004,6 +5004,13 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         optimizer_class = torch.optim.AdamW
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+    elif optimizer_type == "EGGROLL".lower():
+        from library.eggroll_optimizer import EGGROLL
+
+        logger.info(f"use EGGROLL optimizer (Evolution Strategies, gradient-free) | {optimizer_kwargs}")
+        optimizer_class = EGGROLL
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
     elif optimizer_type.endswith("schedulefree".lower()):
         try:
             import schedulefree as sf

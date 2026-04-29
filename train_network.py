@@ -1400,39 +1400,76 @@ class NetworkTrainer:
                     # preprocess batch for each model
                     self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True)
 
-                    loss = self.process_batch(
-                        batch,
-                        text_encoders,
-                        unet,
-                        network,
-                        vae,
-                        noise_scheduler,
-                        vae_dtype,
-                        weight_dtype,
-                        accelerator,
-                        args,
-                        text_encoding_strategy,
-                        tokenize_strategy,
-                        is_train=True,
-                        train_text_encoder=train_text_encoder,
-                        train_unet=train_unet,
-                    )
+                    # accelerator.prepare() wraps the optimizer in
+                    # AcceleratedOptimizer (no __getattr__ forwarding), so we
+                    # peek at the inner optimizer to detect EGGROLL.
+                    inner_optimizer = optimizer
+                    while not hasattr(inner_optimizer, "is_eggroll_optimizer") and hasattr(inner_optimizer, "optimizer"):
+                        inner_optimizer = inner_optimizer.optimizer
+                    is_eggroll = getattr(inner_optimizer, "is_eggroll_optimizer", False)
+                    if is_eggroll:
+                        # Gradient-free Evolution Strategies path. The closure is
+                        # invoked 2*M times per step under varying perturbations
+                        # of the trainable parameters; we never call .backward().
+                        # We bypass AcceleratedOptimizer entirely because its
+                        # GradScaler-driven step() asserts on scaled gradients
+                        # which we never produce.
+                        def _eggroll_closure():
+                            with torch.no_grad():
+                                return self.process_batch(
+                                    batch,
+                                    text_encoders,
+                                    unet,
+                                    network,
+                                    vae,
+                                    noise_scheduler,
+                                    vae_dtype,
+                                    weight_dtype,
+                                    accelerator,
+                                    args,
+                                    text_encoding_strategy,
+                                    tokenize_strategy,
+                                    is_train=True,
+                                    train_text_encoder=train_text_encoder,
+                                    train_unet=train_unet,
+                                )
 
-                    accelerator.backward(loss)
-                    if accelerator.sync_gradients:
-                        self.all_reduce_network(accelerator, network)  # sync DDP grad manually
-                        if args.max_grad_norm != 0.0:
-                            params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        loss = inner_optimizer.step(_eggroll_closure)
+                        lr_scheduler.step()
+                    else:
+                        loss = self.process_batch(
+                            batch,
+                            text_encoders,
+                            unet,
+                            network,
+                            vae,
+                            noise_scheduler,
+                            vae_dtype,
+                            weight_dtype,
+                            accelerator,
+                            args,
+                            text_encoding_strategy,
+                            tokenize_strategy,
+                            is_train=True,
+                            train_text_encoder=train_text_encoder,
+                            train_unet=train_unet,
+                        )
 
-                        if hasattr(network, "update_grad_norms"):
-                            network.update_grad_norms()
-                        if hasattr(network, "update_norms"):
-                            network.update_norms()
+                        accelerator.backward(loss)
+                        if accelerator.sync_gradients:
+                            self.all_reduce_network(accelerator, network)  # sync DDP grad manually
+                            if args.max_grad_norm != 0.0:
+                                params_to_clip = accelerator.unwrap_model(network).get_trainable_params()
+                                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                            if hasattr(network, "update_grad_norms"):
+                                network.update_grad_norms()
+                            if hasattr(network, "update_norms"):
+                                network.update_norms()
+
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad(set_to_none=True)
 
                 if args.scale_weight_norms:
                     keys_scaled, mean_norm, maximum_norm = accelerator.unwrap_model(network).apply_max_norm_regularization(

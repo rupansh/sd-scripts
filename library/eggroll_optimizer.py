@@ -107,6 +107,8 @@ class EGGROLL(Optimizer):
         sigma_adapt_rate: float = 0.01,
         seed: int = 0,
         antithetic: bool = True,
+        normalize_perturbations: bool = True,
+        noise_dtype: Optional[torch.dtype] = torch.float32,
     ):
         if lr <= 0.0:
             raise ValueError(f"Invalid lr: {lr}")
@@ -137,7 +139,11 @@ class EGGROLL(Optimizer):
             sigma_max=sigma_max,
             sigma_target_var=sigma_target_var,
             sigma_adapt_rate=sigma_adapt_rate,
+            normalize_perturbations=normalize_perturbations,
         )
+        # Sample/keep noise + originals in this dtype to avoid fp16 underflow
+        # of small perturbations (entries on the order of σ/√d).
+        self._noise_dtype = noise_dtype
         super().__init__(params, defaults)
         self._step_counter = 0
         self._base_seed = int(seed)
@@ -156,27 +162,59 @@ class EGGROLL(Optimizer):
         return gen
 
     def _sample_perturbations(
-        self, p: torch.Tensor, M: int, rank: int, p_index: int, step: int
+        self, p: torch.Tensor, M: int, rank: int, p_index: int, step: int, normalize: bool
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Sequence[int]]:
         """
         Sample M rank-`rank` perturbations for parameter `p`.
 
         Returns (A, B, original_shape) where:
             - For 2D-flattenable params: A is [M, rank, dim_out],
-              B is [M, rank, dim_in]; perturbation j is sum_k A[j,k] ⊗ B[j,k].
+              B is [M, rank, dim_in]; perturbation j is Σ_k A[j,k] ⊗ B[j,k].
             - For 1D/0D params: A is [M, numel] (vector noise), B is None.
+
+        When `normalize` is True, each perturbation tensor E_j is rescaled to
+        unit Frobenius norm so that σ directly controls ||σ·E_j||_F regardless
+        of parameter shape (essential for SDXL-scale matrices where the raw
+        Frobenius norm of an N(0,1)-sampled rank-1 outer product grows like
+        √(d_out · d_in)).
         """
         gen = self._generator_for(p_index, step, p.device)
-        flat, shape = _flatten_2d(p.detach())
-        d_out, d_in = flat.shape
+        _, shape = _flatten_2d(p.detach())
+        dtype = self._noise_dtype if self._noise_dtype is not None else p.dtype
 
         if p.dim() <= 1:
             # vector / scalar noise — no outer product
-            A = torch.randn(M, p.numel(), generator=gen, device=p.device, dtype=p.dtype)
+            A = torch.randn(M, p.numel(), generator=gen, device=p.device, dtype=dtype)
+            if normalize:
+                # Normalize each row so ||E_j||_2 = 1 ⇒ sigma is the literal
+                # L2-norm of the perturbation in weight space.
+                norms = A.norm(dim=-1, keepdim=True).clamp(min=1e-12)
+                A = A / norms
             return A, None, shape
 
-        A = torch.randn(M, rank, d_out, generator=gen, device=p.device, dtype=p.dtype)
-        B = torch.randn(M, rank, d_in, generator=gen, device=p.device, dtype=p.dtype)
+        # ND ≥ 2: flatten to [d_out, d_in] for the rank-r outer product.
+        d_out = shape[0]
+        d_in = 1
+        for s in shape[1:]:
+            d_in *= int(s)
+
+        A = torch.randn(M, rank, d_out, generator=gen, device=p.device, dtype=dtype)
+        B = torch.randn(M, rank, d_in, generator=gen, device=p.device, dtype=dtype)
+
+        if normalize:
+            # Compute per-perturbation Frobenius norm of E_j = Σ_k A[j,k] ⊗ B[j,k]
+            # without materializing the full matrix:
+            #   ||E_j||_F^2 = Σ_k Σ_l (A[j,k]·A[j,l]) (B[j,k]·B[j,l])
+            # = trace((A_j A_j^T)(B_j B_j^T))   for A_j: [rank, d_out].
+            AAT = torch.einsum("mkd,mld->mkl", A, A)  # [M, rank, rank]
+            BBT = torch.einsum("mkd,mld->mkl", B, B)  # [M, rank, rank]
+            fro_sq = (AAT * BBT).sum(dim=(-2, -1)).clamp(min=1e-24)  # [M]
+            # Rescale by the (rank+1)-th root: split √||E|| across A and B so
+            # neither factor blows up alone. Equivalent to dividing E by ||E||_F.
+            scale = fro_sq.rsqrt().sqrt()  # ||E||_F^{-1/2}
+            A = A * scale.view(M, 1, 1)
+            B = B * scale.view(M, 1, 1)
+
         return A, B, shape
 
     @staticmethod
@@ -248,8 +286,13 @@ class EGGROLL(Optimizer):
         if not flat_params:
             return torch.tensor(float("nan"))
 
-        # ---- save originals so we can perturb in-place and restore
-        originals = [p.data.clone() for _, _, p in flat_params]
+        # ---- save originals (in high-precision noise_dtype to avoid fp16
+        # accumulation error across 2M perturbations).
+        target_dtype = self._noise_dtype if self._noise_dtype is not None else None
+        originals = [
+            p.data.detach().clone().to(dtype=target_dtype) if target_dtype is not None else p.data.clone()
+            for _, _, p in flat_params
+        ]
 
         # ---- decide M (population/2). All param groups must agree on pop size.
         pop_sizes = {g["population_size"] for _, g, _ in flat_params}
@@ -260,13 +303,23 @@ class EGGROLL(Optimizer):
         # ---- sample noise for every parameter once
         rank_per_group = {id(g): g["rank"] for _, g, _ in flat_params}
         sigma_per_group = {id(g): g["_current_sigma"] for _, g, _ in flat_params}
+        normalize_per_group = {id(g): g["normalize_perturbations"] for _, g, _ in flat_params}
         samples: List[Tuple[torch.Tensor, Optional[torch.Tensor], Sequence[int]]] = []
         for idx, group, p in flat_params:
             samples.append(
-                self._sample_perturbations(p, M, rank_per_group[id(group)], idx, step)
+                self._sample_perturbations(
+                    p,
+                    M,
+                    rank_per_group[id(group)],
+                    idx,
+                    step,
+                    normalize_per_group[id(group)],
+                )
             )
 
-        # ---- evaluate fitness for each antithetic pair
+        # ---- evaluate fitness for each antithetic pair. Perturbations are
+        # accumulated in high precision (noise_dtype); we cast to p.dtype only
+        # when writing to the parameter.
         fitness_pos = torch.empty(M)
         fitness_neg = torch.empty(M)
         for j in range(M):
@@ -274,7 +327,8 @@ class EGGROLL(Optimizer):
             for (idx, group, p), (A, B, shape), orig in zip(flat_params, samples, originals):
                 sigma = sigma_per_group[id(group)]
                 E = self._materialize(A, B, j, shape)
-                p.data.copy_(orig + sigma * E)
+                perturbed = orig + sigma * E
+                p.data.copy_(perturbed.to(dtype=p.dtype))
             loss = closure()
             fitness_pos[j] = -float(loss.detach())  # negate: we want to maximize fitness
 
@@ -282,13 +336,14 @@ class EGGROLL(Optimizer):
             for (idx, group, p), (A, B, shape), orig in zip(flat_params, samples, originals):
                 sigma = sigma_per_group[id(group)]
                 E = self._materialize(A, B, j, shape)
-                p.data.copy_(orig - sigma * E)
+                perturbed = orig - sigma * E
+                p.data.copy_(perturbed.to(dtype=p.dtype))
             loss = closure()
             fitness_neg[j] = -float(loss.detach())
 
         # ---- restore originals before we apply the aggregated update
         for (_, _, p), orig in zip(flat_params, originals):
-            p.data.copy_(orig)
+            p.data.copy_(orig.to(dtype=p.dtype))
 
         # ---- compute antithetic delta and shape it
         delta_f = (fitness_pos - fitness_neg) / 2.0  # [M]
@@ -300,10 +355,12 @@ class EGGROLL(Optimizer):
             std = delta_f.std().clamp(min=1e-8)
             shaped = (delta_f - delta_f.mean()) / std
 
-        # ---- apply the per-parameter update
+        # ---- apply the per-parameter update. We compute the update in the
+        # noise_dtype (typically fp32) for stability and write the new
+        # parameter value back in p.dtype.
         avg_loss = -float((fitness_pos.mean() + fitness_neg.mean()) / 2.0)
-        for (idx, group, p), (A, B, shape) in zip(flat_params, samples):
-            shaped_dev = shaped.to(device=p.device, dtype=p.dtype)
+        for ((idx, group, p), (A, B, shape), orig) in zip(flat_params, samples, originals):
+            shaped_dev = shaped.to(device=p.device, dtype=A.dtype)
             delta_W = self._aggregate_update(A, B, shaped_dev, shape)
 
             # clip
@@ -317,18 +374,21 @@ class EGGROLL(Optimizer):
             if group["momentum"] > 0:
                 state = self.state[p]
                 buf = state.get("velocity")
-                if buf is None:
-                    buf = torch.zeros_like(p.data)
+                if buf is None or buf.dtype != delta_W.dtype:
+                    buf = torch.zeros_like(delta_W)
                     state["velocity"] = buf
                 buf.mul_(group["momentum"]).add_(delta_W)
                 delta_W = buf
 
-            # parameter update
-            p.data.add_(delta_W, alpha=group["lr"])
+            # parameter update — work in noise_dtype to avoid lossy
+            # accumulation when p.dtype is fp16/bf16
+            new_W = orig + group["lr"] * delta_W
 
             # decoupled weight decay
             if group["weight_decay"] > 0:
-                p.data.mul_(1.0 - group["lr"] * group["weight_decay"])
+                new_W = new_W * (1.0 - group["lr"] * group["weight_decay"])
+
+            p.data.copy_(new_W.to(dtype=p.dtype))
 
         # ---- adaptive sigma
         for group in self.param_groups:

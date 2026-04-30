@@ -113,7 +113,9 @@ def test_convex_convergence():
     torch.manual_seed(42)
     p = Parameter(torch.zeros(8, 8))
     target = torch.full_like(p, 0.3)
-    opt = _make_optimizer([p], lr=0.5, sigma=0.05, population_size=32)
+    # With normalize_perturbations=True (default), ||E||_F = 1, so each step
+    # moves by lr in weight-space. We compensate by raising lr.
+    opt = _make_optimizer([p], lr=1.0, sigma=0.05, population_size=32)
 
     def closure():
         return ((p - target) ** 2).mean()
@@ -141,6 +143,77 @@ def test_deterministic_with_seed():
     opt1.step(make_closure(p1))
     opt2.step(make_closure(p2))
     assert torch.allclose(p1.detach(), p2.detach(), atol=1e-7)
+
+
+def test_normalize_perturbations_makes_sigma_size_invariant():
+    """With normalize_perturbations=True, the maximum displacement on the
+    first step should be ~σ regardless of parameter shape."""
+    torch.manual_seed(0)
+    sigma = 0.05
+    big = Parameter(torch.zeros(1280, 1280))
+    small = Parameter(torch.zeros(64, 64))
+
+    # closure independent of params — pure perturbation/restore probe
+    def closure_big():
+        return big.sum() * 0.0
+    def closure_small():
+        return small.sum() * 0.0
+
+    opt_big = EGGROLL([big], lr=1.0, sigma=sigma, population_size=4,
+                      clip_norm=0.0, fitness_shaping="zscore",
+                      normalize_perturbations=True, seed=1)
+    opt_small = EGGROLL([small], lr=1.0, sigma=sigma, population_size=4,
+                        clip_norm=0.0, fitness_shaping="zscore",
+                        normalize_perturbations=True, seed=1)
+    # Probe perturbation magnitude directly via the sampler.
+    A_b, B_b, _ = opt_big._sample_perturbations(big, M=4, rank=1, p_index=0, step=0, normalize=True)
+    A_s, B_s, _ = opt_small._sample_perturbations(small, M=4, rank=1, p_index=0, step=0, normalize=True)
+
+    def fro(A, B, j):
+        E = A[j].transpose(0, 1) @ B[j]
+        return E.norm().item()
+
+    big_norm = fro(A_b, B_b, 0)
+    small_norm = fro(A_s, B_s, 0)
+    # Both perturbations should have unit Frobenius norm to within float roundoff
+    assert abs(big_norm - 1.0) < 1e-4, big_norm
+    assert abs(small_norm - 1.0) < 1e-4, small_norm
+
+
+def test_normalize_perturbations_off_blows_up_with_size():
+    """Without normalization, ||E||_F grows like √(d_out·d_in)."""
+    torch.manual_seed(0)
+    big = Parameter(torch.zeros(512, 512))
+    small = Parameter(torch.zeros(32, 32))
+    opt = EGGROLL([big, small], lr=0.05, sigma=0.02, population_size=4,
+                  normalize_perturbations=False, seed=1)
+    A_b, B_b, _ = opt._sample_perturbations(big, M=4, rank=1, p_index=0, step=0, normalize=False)
+    A_s, B_s, _ = opt._sample_perturbations(small, M=4, rank=1, p_index=1, step=0, normalize=False)
+    big_norm = (A_b[0].t() @ B_b[0]).norm().item()
+    small_norm = (A_s[0].t() @ B_s[0]).norm().item()
+    # Ratio should track √((512·512)/(32·32)) = 16, modulo sample variance.
+    assert big_norm / small_norm > 8.0, (big_norm, small_norm)
+
+
+def test_normalized_eggroll_converges_with_unified_sigma():
+    """The whole point: same σ should work across heterogeneous param sizes."""
+    torch.manual_seed(0)
+    big = Parameter(torch.zeros(64, 64))
+    small = Parameter(torch.zeros(8))
+    target_big = torch.full_like(big, 0.2)
+    target_small = torch.full_like(small, 0.5)
+
+    opt = EGGROLL([big, small], lr=0.5, sigma=0.05, population_size=32,
+                  normalize_perturbations=True, seed=0)
+
+    def closure():
+        return ((big - target_big) ** 2).mean() + ((small - target_small) ** 2).mean()
+
+    initial = closure().item()
+    for _ in range(40):
+        opt.step(closure)
+    final = closure().item()
+    assert final < initial * 0.4, f"unified-σ EGGROLL failed to converge: {initial} -> {final}"
 
 
 def test_dora_like_setup_decreases_loss():

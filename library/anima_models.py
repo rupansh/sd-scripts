@@ -1,6 +1,7 @@
 # Anima Model Architecture
 # Original code: NVIDIA CORPORATION & AFFILIATES, licensed under Apache-2.0
 
+import contextlib
 import math
 from typing import Any, Optional, Tuple, Union
 
@@ -740,8 +741,14 @@ class FinalLayer(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         use_fp32: bool = False,
     ):
-        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers)
-        with torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=use_fp32):
+        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers).
+        # When use_fp32=False, keep outer autocast (e.g. bf16) — passing enabled=False would disable it.
+        ctx = (
+            torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32)
+            if use_fp32
+            else contextlib.nullcontext()
+        )
+        with ctx:
             if self.use_adaln_lora:
                 assert adaln_lora_B_T_3D is not None
                 shift_B_T_D, scale_B_T_D = (
@@ -875,8 +882,14 @@ class Block(nn.Module):
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
-        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers)
-        with torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32, enabled=use_fp32):
+        # Compute AdaLN modulation parameters (in float32 when fp16 to avoid overflow in Linear layers).
+        # When use_fp32=False, keep outer autocast (e.g. bf16) — passing enabled=False would disable it.
+        ctx = (
+            torch.autocast(device_type=x_B_T_H_W_D.device.type, dtype=torch.float32)
+            if use_fp32
+            else contextlib.nullcontext()
+        )
+        with ctx:
             if self.use_adaln_lora:
                 shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
                     self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D

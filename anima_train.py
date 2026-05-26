@@ -686,6 +686,8 @@ def train(args):
             sample_prompts_te_outputs,
         )
 
+        optimizer_train_fn()
+
     # End training
     is_main_process = accelerator.is_main_process
     dit = accelerator.unwrap_model(dit)
